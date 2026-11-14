@@ -12,11 +12,14 @@ from fastapi import FastAPI, HTTPException, Request
 import requests
 
 RELEASE = '02080970ccd59a2e1aeec4fd66a17640da2cddf1'
+# Served adapters a client may ask for: p1 alone, or the three members of the step-level vote (lifemate.ensemble).
+MODELS = {'lifemate', 'lifemate_e1', 'lifemate_synth'}
+CHAT_SLOTS = 3   # one in-flight request per vote member; vLLM batches them (--max-num-seqs >= 3)
 
 
 def create_app(asr, key, context_limit=16384):
     if len(key) < 32: raise ValueError('Secret must have at least 32 characters')
-    app = FastAPI(); lock = threading.Lock()
+    app = FastAPI(); lock = threading.Lock(); chat_slots = threading.BoundedSemaphore(CHAT_SLOTS)
 
     @app.middleware('http')
     async def auth(request: Request, call_next):
@@ -36,15 +39,15 @@ def create_app(asr, key, context_limit=16384):
 
     @app.post('/v1/chat/completions')
     def chat(body: dict):
-        if body.get('model') != 'lifemate' or body.get('stream', False): raise HTTPException(400,'Use lifemate, non-streaming')
+        if body.get('model') not in MODELS or body.get('stream', False): raise HTTPException(400,'Use a served LifeMate adapter, non-streaming')
         body={k:v for k,v in body.items() if k in {'model','messages','tools','tool_choice','temperature','seed','max_tokens','chat_template_kwargs'}}
         body.update(temperature=0,seed=42,max_tokens=512,chat_template_kwargs={'enable_thinking':False})
-        if not lock.acquire(blocking=False): raise HTTPException(429,'Model busy')
+        if not chat_slots.acquire(blocking=False): raise HTTPException(429,'Model busy')
         try:
             r=requests.post('http://127.0.0.1:8001/v1/chat/completions',json=body,timeout=120)
             if r.status_code!=200: raise HTTPException(r.status_code,'vLLM rejected request; inspect Colab logs')
             return r.json()
-        finally: lock.release()
+        finally: chat_slots.release()
 
     @app.post('/v1/audio/transcriptions')
     def transcribe(body: dict):

@@ -36,11 +36,13 @@ def _proposal_key(response: dict) -> str:
 
 
 class EnsembleChat:
-    def __init__(self, url: str, members: list[tuple[str, str]], timeout: float = 25) -> None:
-        """members: [(served model name, orchestration), ...]; the first is the tie-breaker."""
+    def __init__(self, url: str | None, members: list[tuple[str, str]], timeout: float = 25, client=None) -> None:
+        """members: [(served model name, orchestration), ...]; the first is the tie-breaker. client(name) builds a member's chat
+        client (default: LocalChat on url; the dashboard passes the Colab Hosted client)."""
         if not members:
             raise ValueError("empty ensemble")
-        self.members = [(LocalChat(url, name, timeout), name, orch) for name, orch in members]
+        client = client or (lambda name: LocalChat(url, name, timeout))
+        self.members = [(client(name), name, orch) for name, orch in members]
         self.pool = ThreadPoolExecutor(max_workers=len(members))
         self.heads: dict[str, tuple[dict, dict]] = {}
         self.last_votes: list[dict] = []

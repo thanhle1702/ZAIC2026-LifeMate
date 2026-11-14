@@ -9,7 +9,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(d, 'PROJECT', tmp_path)
     monkeypatch.setenv('LIFEMATE_MODEL_API_URL', 'https://test.invalid')
     monkeypatch.setenv('LIFEMATE_MODEL_API_KEY', 'x'*32)
-    sample=dict(id='a', audio='audio/a.wav', audio_text='hello', context={}, history=[], label={'tool_calls':[]})
+    sample=dict(id='a', audio='audio/a.wav', audio_text='hello', context={'current_time':'2026-11-16T17:00:00+07:00'}, history=[], label={'tool_calls':[]})
     monkeypatch.setattr(d, 'items', lambda *a: iter([deepcopy(sample)]))
     monkeypatch.setattr(d, 'catalog', lambda *a: {})
     monkeypatch.setattr(d, 'installed_tools', lambda *a: [])
@@ -166,3 +166,39 @@ def test_public_gate_blocks_only_transport_failures(setup, monkeypatch, terminat
     assert validation['blocking_errors']==([] if ready else ['a'])
     assert validation['incomplete_samples']==(['a'] if ready else [])
     assert d.read(setup/'job.json')['state']==('completed' if ready else 'failed')
+
+
+def test_vote_queries_every_served_member_and_records_votes(setup, monkeypatch):
+    monkeypatch.setenv('LIFEMATE_ENSEMBLE', 'lifemate:E1P,lifemate_e1:E1,lifemate_synth:E1')
+    asked=[]
+    class Member:
+        def __init__(self,name): self.name=name
+        def complete(self,messages,tools,timeout=None):
+            asked.append((self.name,messages[0]['content'][:20],timeout))
+            stop={'choices':[{'message':{'role':'assistant','content':'done'},'finish_reason':'stop'}]}
+            call={'choices':[{'message':{'role':'assistant','content':None,'tool_calls':[{'id':'c','type':'function',
+                  'function':{'name':'x__y','arguments':'{}'}}]},'finish_reason':'tool_calls'}]}
+            return call if self.name=='lifemate' else stop     # p1 is outvoted 2-1
+    class Host(d.Hosted):
+        def __init__(self,*a): pass
+        def request(self,*a): return {'release_revision': d.RELEASE, 'data':[{'id':n} for n in ('lifemate','lifemate_e1','lifemate_synth')]}
+        def for_model(self,name): return Member(name)
+    monkeypatch.setattr(d,'Hosted',Host)
+    replies=[]
+    def execute(view, transcript, tools, env, llm, transcribe, log, **kwargs):
+        replies.append(llm.complete([{'role':'system','content':'x'},{'role':'user','content':'u'}],[],timeout=5))
+        log('terminations',{'status':'no_action'})
+    monkeypatch.setattr(d,'execute',execute)
+    d.run(setup)
+    assert sorted(n for n,_,_ in asked)==['lifemate','lifemate_e1','lifemate_synth']
+    assert all(t==5 for _,_,t in asked)
+    assert replies[0]['choices'][0]['message']['content']=='done'
+    events=[json.loads(line) for line in (setup/'trace.jsonl').read_text(encoding='utf-8').splitlines()]
+    votes=[e for e in events if e['event_type']=='ensemble_votes'][0]['votes']
+    assert votes[0]['agreement']=='2/3'
+    assert d.read(setup/'job.json')['ensemble']==['lifemate:E1P','lifemate_e1:E1','lifemate_synth:E1']
+
+
+def test_vote_refuses_a_colab_without_every_member(setup, monkeypatch):
+    monkeypatch.setenv('LIFEMATE_ENSEMBLE', 'lifemate:E1P,lifemate_e1:E1')
+    with pytest.raises(ValueError, match='every vote member'): d.run(setup)

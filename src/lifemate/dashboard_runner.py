@@ -11,6 +11,7 @@ import uuid
 
 from .hosted_runner import Hosted, RELEASE
 from .agent import execute
+from .ensemble import EnsembleChat
 from .data import DATA_ROOT, PROJECT, VALIDATION_IDS, items, catalog, installed_tools, audio_path
 from .metrics import exact_tool_f1
 from .scoring import fuzzy_keys, score_sample
@@ -22,6 +23,14 @@ from .history import runtime_status
 MODEL = 'Qwen3.5-4B BF16 + p1 / Gipformer'
 EVALUATOR = 'datyth-strict-f1-hash-v2-formula'
 HARNESS = 'e1p-remediation-v1'
+
+
+def ensemble_members():
+    """LIFEMATE_ENSEMBLE, same format as configs/release.sh: "served:orchestration,..." with p1 first (it breaks ties)."""
+    raw = os.environ.get('LIFEMATE_ENSEMBLE', '').strip()
+    members = [tuple(m.strip().split(':', 1)) for m in raw.split(',') if m.strip()] if raw else []
+    if any(len(m) != 2 for m in members): raise ValueError('LIFEMATE_ENSEMBLE must look like lifemate:E1P,lifemate_e1:E1,...')
+    return members
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -44,7 +53,8 @@ def run(directory):
     specs = catalog(DATA_ROOT, split)
     fuzzy = fuzzy_keys(specs)
     # Resume cannot silently mix code, inputs, config or release identities.
-    fingerprint = hashlib.sha256(json.dumps([config, samples, specs, RELEASE], sort_keys=True).encode())
+    members = ensemble_members()
+    fingerprint = hashlib.sha256(json.dumps([config, samples, specs, RELEASE, members], sort_keys=True).encode())
     for path in sorted((PROJECT / 'src/lifemate').glob('*.py')): fingerprint.update(path.read_bytes())
     signature = fingerprint.hexdigest()
     checkpoint = directory / 'manifest.json'
@@ -54,20 +64,26 @@ def run(directory):
     identity = hosted.request('/v1/models')
     if identity.get('release_revision') != RELEASE or not any(m['id'] == 'lifemate' for m in identity.get('data', [])):
         raise ValueError('Wrong Colab release')
+    served = {m['id'] for m in identity.get('data', [])}
+    if members and not {name for name, _ in members} <= served:
+        raise ValueError(f'Colab does not serve every vote member: {[n for n, _ in members]} vs {sorted(served)}')
+    llm = EnsembleChat(None, members, client=hosted.for_model) if members else hosted
+    label = MODEL if not members else 'Qwen3.5-4B BF16 vote ' + '+'.join(n for n, _ in members) + ' / Gipformer'
     atomic(checkpoint, {'signature': signature, 'runtime': identity, 'ids': [s['id'] for s in samples],
                         'harness_revision':HARNESS,
                         'note': 'p1 trained on all TRAIN; diagnostic only, not held-out or official score.'})
     job.update(state='running', pid=os.getpid(), total=len(samples)*len(modes), processed=0, harness_revision=HARNESS,
+               ensemble=[':'.join(m) for m in members] or None,
                identity={k:identity.get(k) for k in ('release_revision','runtime','profile','asr','context_limit')})
     atomic(directory/'job.json', job)
     def cancelled():
         if (directory/'stop.request').exists(): raise Paused()
-    original_complete = hosted.complete
+    original_complete = llm.complete
     def complete(*args, **kwargs):
         cancelled()
         kwargs['timeout'] = min(kwargs.get('timeout') or 120, config['request_seconds'])
         result = original_complete(*args, **kwargs); cancelled(); return result
-    hosted.complete = complete
+    llm.complete = complete
     all_modes = {}
     live = None; branch = directory
     try:
@@ -77,7 +93,7 @@ def run(directory):
             saved = read(branch/'checkpoint.json') if (branch/'checkpoint.json').exists() else []
             if [r['prediction']['id'] for r in saved] != [s['id'] for s in samples[:len(saved)]]:
                 raise ValueError('Checkpoint order mismatch')
-            metadata = dict(name=job['name'], model=MODEL, split=split, mode=mode, run_id=job['id']+':'+mode,
+            metadata = dict(name=job['name'], model=label, split=split, mode=mode, run_id=job['id']+':'+mode,
                         started_at=job['created_at'], expected_total=len(samples), evaluator_revision=EVALUATOR,
                             harness_revision=HARNESS)
             def publish():
@@ -90,7 +106,7 @@ def run(directory):
             # Rebuild only committed traces on resume; discard the partial sample's trace.
             (branch/'trace.jsonl').write_text(''.join(json.dumps(e, ensure_ascii=False)+'\n' for r in saved for e in r['events']), encoding='utf-8')
             atomic(branch/'live-inputs.json', samples)
-            live = dict(run_id=job['id'], name=job['name'], model=MODEL, split=split, mode=mode, total=len(samples),
+            live = dict(run_id=job['id'], name=job['name'], model=label, split=split, mode=mode, total=len(samples),
                         kind='evaluation' if split=='train' else 'inference', state='running', pid=os.getpid(),
                         started_at=job['created_at'], updated_at=now(), generation=uuid.uuid4().hex,
                         audio_root=str(DATA_ROOT/split), evaluator_revision=EVALUATOR)
@@ -165,7 +181,9 @@ def run(directory):
                     view=deepcopy({k:item[k] for k in ('id','audio','context','history')})
                     for turn in view['history']:
                         if turn.get('role')=='user': turn.pop('audio_text',None)
-                    execute(view,transcript,installed_tools(item,specs),env,hosted,transcribe,log,
+                    if members:
+                        llm.bind(view,transcript,installed_tools(item,specs)); llm.last_votes=[]
+                    execute(view,transcript,installed_tools(item,specs),env,llm,transcribe,log,
                             max_turns=config['max_steps'],deadline_seconds=max(.001,config['sample_seconds']-(time.monotonic()-start)),
                             orchestration='E1P',dedup_calls=True,retry_cap=2)
                     status=runtime_status(termination.get('status'))
@@ -174,6 +192,7 @@ def run(directory):
                     status='execution_error'
                     termination.setdefault('status',type(exc).__name__)
                     emit('sample_error',error_kind=type(exc).__name__,error=str(exc),http_status=getattr(exc,'status_code',None))
+                if members: emit('ensemble_votes',votes=llm.last_votes)
                 inference_seconds=time.monotonic()-start
                 prediction=dict(id=item['id'],tool_calls=env.get_tool_calls(),state_hash=env.get_state_hash())
                 gold_calls=item['label']['tool_calls'] if split=='train' else None

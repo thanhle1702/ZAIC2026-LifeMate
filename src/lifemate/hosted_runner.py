@@ -32,12 +32,16 @@ class RemoteHTTPError(RuntimeError):
 
 
 class Hosted:
-    def __init__(self,url,key):
+    def __init__(self,url,key,model='lifemate'):
         u=urlparse(url)
         if u.scheme!='https' or u.username or u.password or u.query or u.fragment or u.path not in ('','/'):
             raise ValueError('Use the HTTPS tunnel origin')
         if len(key)<32:raise ValueError('Missing Colab secret')
-        self.url=url.rstrip('/');self.session=requests.Session();self.session.headers['Authorization']='Bearer '+key
+        self.url=url.rstrip('/');self.model=model;self.key=key
+        self.session=requests.Session();self.session.headers['Authorization']='Bearer '+key
+    def for_model(self,model):
+        """Same endpoint, another served adapter, own HTTP session (vote members are queried from parallel threads)."""
+        return Hosted(self.url,self.key,model)
     def request(self,path,body=None,timeout=120):
         try:
             r=self.session.request('GET' if body is None else 'POST',self.url+path,json=body,timeout=timeout,allow_redirects=False)
@@ -46,7 +50,7 @@ class Hosted:
         if r.status_code!=200:raise RemoteHTTPError(r.status_code)
         return r.json()
     def complete(self,messages,tools,timeout=None):
-        return self.request('/v1/chat/completions',{'model':'lifemate','messages':merge_system(messages),
+        return self.request('/v1/chat/completions',{'model':self.model,'messages':merge_system(messages),
             'tools':tools,'tool_choice':'auto','temperature':0,'seed':42,'max_tokens':512,
             'chat_template_kwargs':{'enable_thinking':False}},timeout=min(timeout or 120,120))
     def transcribe(self,path,timeout=120):
