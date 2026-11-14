@@ -15,6 +15,26 @@ def folded(text):
                            if not unicodedata.combining(c)).split())
 
 
+# IATA code and city spellings of the same place (catalog: origin/destination accept either).
+PLACES = {
+    'sgn': 'ho chi minh', 'tp hcm': 'ho chi minh', 'tphcm': 'ho chi minh', 'tp ho chi minh': 'ho chi minh',
+    'thanh pho ho chi minh': 'ho chi minh', 'sai gon': 'ho chi minh', 'han': 'ha noi', 'dad': 'da nang',
+    'cxr': 'nha trang', 'pqc': 'phu quoc', 'hui': 'hue', 'uih': 'quy nhon', 'vca': 'can tho', 'hph': 'hai phong',
+    'vdh': 'dong hoi', 'dli': 'da lat', 'vii': 'vinh', 'bmv': 'buon ma thuot', 'thd': 'thanh hoa', 'vcs': 'con dao',
+    'pxu': 'pleiku', 'tbb': 'tuy hoa', 'vdo': 'van don', 'vcl': 'chu lai',
+}
+
+
+def place(value):
+    key = ' '.join(re.sub(r'[^\w]+', ' ', folded(str(value))).split())
+    return PLACES.get(key, key)
+
+
+def same_filter(key, a, b):
+    if key in ('origin', 'destination') and a is not None and b is not None: return place(a) == place(b)
+    return a == b
+
+
 def objects(value):
     if isinstance(value, dict):
         yield value
@@ -116,7 +136,9 @@ class ActionPolicy:
 
     def repeat_allowed(self, name, args):
         if name != 'loyalty.redeem': return False
-        clauses = [c for c in re.split(r'[;]|\b(?:roi|va|sau do)\b',folded(self.request)) if 'doi' in c.split()]
+        # Split before folding: folded 'doi' would also catch dời/đôi/đội/đối/dõi.
+        request = unicodedata.normalize('NFC', self.request).lower()
+        clauses = [folded(c) for c in re.split(r'[;]|\b(?:rồi|và|sau đó)\b', request) if 'đổi' in re.findall(r'\w+', c)]
         if not clauses: return False
         if len(clauses) == 1: text = clauses[0]
         else:
@@ -158,7 +180,7 @@ class ActionPolicy:
     def read_error(self, name, args, cap):
         group=self.search_group(name,args)
         if group['empty']:
-            changed={k:v for k,v in group['filters'].items() if args.get(k)!=v}
+            changed={k:v for k,v in group['filters'].items() if not same_filter(k,args.get(k),v)}
             flexible=bool(re.search(r'ngay (?:nao|khac)|bat ky|som nhat|muon nhat',folded(self.request)))
             if changed and not flexible:
                 return 'search_constraint_change', f'Previous search was empty. Keep the user date/route filters {group["filters"]}; do not invent a different date or route. Use only schema-valid query fallback or ask_missing_info.'

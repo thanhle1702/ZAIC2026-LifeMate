@@ -130,3 +130,23 @@ def test_real_train_repeated_redemptions_replay_without_blocking_second_voucher(
             lambda k,r:events.append((k,r)),dedup_calls=True,retry_cap=2,max_turns=12)
     assert env.get_tool_calls()==item['label']['tool_calls']
     assert not [r for k,r in events if k=='tool_events' and not r.get('executed')]
+
+
+def test_iata_code_and_city_name_are_the_same_route():
+    p=ActionPolicy('tìm chuyến bay đi Hà Nội')
+    first={'origin':'SGN','destination':'HAN','date':'2026-11-09'}
+    p.record_read('flights.search',first,{'ok':True,'flights':[]},True)
+    assert p.read_error('flights.search',{**first,'origin':'TP.HCM','destination':'Hà Nội'},3) is None
+    assert p.read_error('flights.search',{**first,'destination':'DAD'},3)[0]=='search_constraint_change'
+    assert p.read_error('flights.search',{**first,'date':'2026-11-10'},3)[0]=='search_constraint_change'
+
+
+@pytest.mark.parametrize('request_text,allowed',[
+    ('dời lịch họp sang chiều rồi đổi hai ly cà phê', True),     # dời is not a redemption clause
+    ('đổi hai ly cà phê', True),
+    ('dời hai ly cà phê sang mai', False),                        # no đổi at all
+])
+def test_redeem_clause_needs_the_real_word_doi(request_text,allowed):
+    p=ActionPolicy(request_text)
+    p.observe('loyalty.get_points',{}, {'ok':True,'programs':[{'id':'p','points':100,'rewards':[{'id':'r','cost':10}]}]},'read')
+    assert p.repeat_allowed('loyalty.redeem',{'program':'p','reward_id':'r'}) is allowed
