@@ -83,7 +83,7 @@ class CoreTest(unittest.TestCase):
         row = execute(self.ITEM, "xóa báo thức", [self.ALARM_DELETE], env, model, lambda _: "", lambda kind, x: events.append((kind, x)))
         self.assertEqual(row["tool_calls"], [])
         self.assertIn("must come from an observed alarm.alarms ID", model.messages[1][-1]["content"])
-        self.assertEqual([x["status"] for kind, x in events if kind == "terminations"], ["no_action"])
+        self.assertEqual([x["status"] for kind, x in events if kind == "terminations"], ["unresolved_tool_error"])
 
     def test_reference_id_from_a_read_is_executed(self):
         class AlarmEnv(MemoryEnv):

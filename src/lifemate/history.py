@@ -3,6 +3,14 @@ from __future__ import annotations
 
 from typing import Callable
 
+HEALTHY_TERMINATIONS = {'completed_write', 'completed_read', 'no_action', 'unsupported',
+                        'missing_information', 'recovered_with_errors'}
+
+
+def runtime_status(termination: str | None) -> str:
+    """Processing contract only. This never claims semantic task success."""
+    return 'completed' if termination in HEALTHY_TERMINATIONS else 'incomplete'
+
 
 def ids_in(value: object) -> set[str]:
     found: set[str] = set()

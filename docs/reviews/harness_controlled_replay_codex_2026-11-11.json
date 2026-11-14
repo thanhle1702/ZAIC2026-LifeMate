@@ -1,0 +1,43 @@
+{
+  "type": "CPU controlled gold proposals; not model inference or leaderboard evaluation",
+  "samples": 1545,
+  "baseline_mismatches": [
+    "train_0037",
+    "train_0241",
+    "train_0922",
+    "train_1005",
+    "train_1033",
+    "train_1319",
+    "train_1340",
+    "train_1447",
+    "train_1583",
+    "train_1696"
+  ],
+  "remediated_mismatches": [
+    "train_0037",
+    "train_0241",
+    "train_1005",
+    "train_1033",
+    "train_1319",
+    "train_1340",
+    "train_1583",
+    "train_1696"
+  ],
+  "improved": [
+    "train_0922",
+    "train_1447"
+  ],
+  "regressed": [],
+  "changed_execution": [
+    "train_0922",
+    "train_1447"
+  ],
+  "remediated_terminations": {
+    "completed_write": 1089,
+    "completed_read": 123,
+    "no_action": 111,
+    "missing_information": 217,
+    "unresolved_tool_error": 4,
+    "search_unresolved": 1
+  }
+}

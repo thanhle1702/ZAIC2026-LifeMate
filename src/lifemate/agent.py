@@ -6,8 +6,8 @@ Orchestrations (prompt + request context):
     E1P  E1D + the Vietnamese name and description of every installed app + generic hints for empty searches (the release)
 Data and inference must use the same orchestration (scripts/data/prepare_agent_sft.py --orchestration).
 
-Checks before env.call, all generic (no app is named): schema (env.validate), x-ref IDs must come from an earlier result or the
-history, no identical call twice (dedup_calls), and a read tool that came back empty retry_cap times is blocked. A rejected call
+Before env.call: official schema/x-ref checks, bounded read recovery and effect-aware dedup. Narrow numeric guards in
+action_policy use only visible observations for known resource contracts. A rejected call
 goes back to the model as an error message and is never executed, so it never reaches the scored call list."""
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ E1D_PROMPT = PROMPT + """Dùng date_reference trong context để đổi "mai", 
 # reading their source. Generic rules worded with TRAIN apps only; no public-only app name or app-specific rule (the cart/checkout
 # pattern seen on public was left out for that reason).
 E1P_PROMPT = E1D_PROMPT + """context.apps ghi tên tiếng Việt và chức năng của từng app đã cài; người dùng hay gọi app bằng tên đó ("bên ví", "app nhắc việc"), hãy chọn app theo tên và chức năng.
-Nếu tool tìm kiếm trả về rỗng hoặc không tìm thấy: thử lại với từ khoá ngắn hơn (bỏ danh xưng, chỉ giữ tên chính), bỏ trống query để liệt kê, hoặc dùng tool danh sách của app; không đưa ngày giờ vào ô từ khoá và không lặp lại đúng lời gọi cũ; vẫn không có thì gọi sys.ask_missing_info.
+Nếu tool tìm kiếm trả về rỗng hoặc không tìm thấy: thử lại với từ khoá ngắn hơn (bỏ danh xưng, chỉ giữ tên chính), chỉ bỏ query nếu schema cho phép, hoặc dùng tool danh sách của app. Giữ nguyên ngày, tuyến đường và điều kiện người dùng; không tự đổi ngày để thử. Không lặp lại lời gọi cũ. Nếu vẫn thiếu thông tin để thực hiện yêu cầu thì gọi sys.ask_missing_info, không bịa ID hoặc đổi ý định.
 Mã hay ID chưa có trong lời nói hoặc kết quả trước đó phải lấy từ tool đọc hoặc danh sách của app; không đoán.
 Giá trị phải tính từ dữ liệu khác (giờ trước/sau một sự kiện, số tiền theo số dư...) thì đọc dữ liệu đó trước rồi mới gọi tool ghi.
 """
@@ -106,14 +106,17 @@ def _record(item: dict, index: int, call: object, log: Callable[[str, dict], Non
 def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe_history: Callable[[str], str],
             log: Callable[[str, dict], None], max_turns: int = 10, deadline_seconds: float = 30, orchestration: str = "E1P",
             dedup_calls: bool = False, retry_cap: int = 0) -> dict:
-    """Run the agent on one sample and return its submission row (the ToolEnv's call list and state hash).
-
-    log(kind, record) receives llm_turns, tool_events, protocol_events and terminations. Raises on a timeout, a malformed model
-    response or after max_turns; the calls already executed stay on env either way."""
+    """One live ToolEnv trajectory; policies use only supplied context and tool observations."""
+    from collections import Counter
+    from .action_policy import ActionPolicy, signature
     if orchestration not in ORCHESTRATIONS:
         raise ValueError(f"unknown orchestration: {orchestration}")
     start = time.monotonic()
     structured, observed_ids = structured_history(item.get("history", []), transcribe_history, {s["name"]: s.get("kind", "unknown") for s in specs})
+    policy = ActionPolicy(transcript)
+    for action in structured['historical_actions']:
+        if action.get('verified'):
+            policy.observe(action['tool'], action.get('arguments',{}), action['result'], action['kind'], historical=True)
     messages = [{"role": "system", "content": prompt_for(orchestration)},
                 {"role": "system", "content": HISTORY_GUIDANCE + "\n" + json.dumps(structured, ensure_ascii=False)},
                 user_message(item, transcript, orchestration, specs)]
@@ -121,135 +124,158 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
     aliases = {s["name"].replace(".", "__"): s["name"] for s in specs}
     specs_by_name = {s["name"]: s for s in specs}
     invalid_proposals = 0
-    completed_write = missing_info = failed_write = False
-    executed_results: dict[str, object] = {}   # dedup_calls: exact (name, arguments) already executed -> its result
-    duplicate_blocks = 0
-    empty_reads: dict[str, int] = {}           # retry_cap: read tool -> how many of its calls came back empty / not found
+    completed_write = missing_info = False
+    blocks = Counter()
+    repair_used = False
+    pending_searches = set()
 
-    def finish(status: str, turns: int) -> dict:
-        log("terminations", {"sample_id": item["id"], "status": status, "turns": turns, "elapsed_seconds": time.monotonic() - start,
-                             "invalid_proposals": invalid_proposals})
-        return {"id": item["id"], "tool_calls": env.get_tool_calls(), "state_hash": env.get_state_hash()}
+    def finish(status, turns):
+        log('terminations', dict(sample_id=item['id'], status=status, turns=turns,
+            elapsed_seconds=time.monotonic()-start, invalid_proposals=invalid_proposals,
+            block_counts=dict(blocks), operation_issues=policy.issues,
+            unresolved_operations=len(policy.unresolved()),
+            recovered_operations=sum(i['state']=='recovered' for i in policy.issues)))
+        return dict(id=item['id'], tool_calls=env.get_tool_calls(), state_hash=env.get_state_hash())
 
-    def reject(index: int, call: dict, validation: dict) -> None:
+    def reject(index, call, name, args, error, category='schema', write_issue=False):
         nonlocal invalid_proposals
         invalid_proposals += 1
-        _record(item, index, call, log, validation=validation, executed=False)
-        messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(validation, ensure_ascii=False)})
+        blocks[category] += 1
+        _record(item,index,call,log,executed=False,name=name,arguments=args,
+                validation={'ok':False,'error':error},block_reason=category)
+        if write_issue: policy.issue(name,args,error,category)
+        messages.append({'role':'tool','tool_call_id':call.get('id',''),
+                         'content':json.dumps({'ok':False,'error':error,'source':'harness','executed':False},ensure_ascii=False)})
 
     for index in range(max_turns):
-        if time.monotonic() - start >= deadline_seconds:
-            log("terminations", {"sample_id": item["id"], "status": "timeout", "turns": index})
-            raise TimeoutError("per-sample agent deadline exceeded")
-        sent = json.loads(json.dumps(messages, ensure_ascii=False))
-        t0 = time.monotonic()
+        remaining = deadline_seconds-(time.monotonic()-start)
+        if remaining <= 0:
+            log('terminations',dict(sample_id=item['id'],status='timeout',turns=index))
+            raise TimeoutError('per-sample agent deadline exceeded')
+        sent=json.loads(json.dumps(messages,ensure_ascii=False))
+        t0=time.monotonic()
+        log('model_request',dict(sample_id=item['id'],turn=index,stage='started'))
         try:
-            response = llm.complete(messages, tools, timeout=max(0.1, deadline_seconds - (t0 - start)))
-        except TimeoutError:
-            log("terminations", {"sample_id": item["id"], "status": "timeout", "turns": index + 1})
-            raise
+            response=llm.complete(messages,tools,timeout=max(.001,remaining))
         except Exception as exc:
-            log("terminations", {"sample_id": item["id"], "status": "model_error", "turns": index + 1, "error": f"{type(exc).__name__}: {exc}"})
+            log('model_request',dict(sample_id=item['id'],turn=index,stage='failed',
+                latency_seconds=time.monotonic()-t0,error_kind=type(exc).__name__,error=str(exc)))
+            log('terminations',dict(sample_id=item['id'],status='timeout' if isinstance(exc,TimeoutError) else 'model_error',turns=index+1))
             raise
+        log('model_request',dict(sample_id=item['id'],turn=index,stage='finished',latency_seconds=time.monotonic()-t0))
         try:
-            choice = response["choices"][0]
-            message = choice["message"]
-            if not isinstance(message, dict):
-                raise ValueError("malformed assistant message")
-            calls = message.get("tool_calls") or []
-            if not isinstance(calls, list) or (message.get("content") is not None and not isinstance(message["content"], str)):
-                raise ValueError("malformed assistant message")
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            log("terminations", {"sample_id": item["id"], "status": "invalid_response", "turns": index + 1, "error": str(exc)})
-            raise ValueError("malformed LLM response") from exc
-        content = message.get("content") or ""
-        log("llm_turns", {"sample_id": item["id"], "turn": index, "messages": sent, "output": message, "finish_reason": choice.get("finish_reason"),
-                          "usage": response.get("usage"), "latency_seconds": time.monotonic() - t0})
-        if content and not calls and _fake_narration(content):
-            log("protocol_events", {"sample_id": item["id"], "turn": index, "kind": "fake_tool_narration", "content": content})
-        if time.monotonic() - start >= deadline_seconds:
-            log("terminations", {"sample_id": item["id"], "status": "timeout", "turns": index + 1})
-            raise TimeoutError("LLM response exceeded per-sample deadline")
-        messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls} if calls
-                        else {"role": "assistant", "content": content})
-        if not calls:
-            status = ("tool_error" if failed_write else "missing_information" if missing_info else "unsupported" if "UNSUPPORTED_REQUEST" in content
-                      else "completed_write" if completed_write else "completed_read" if env.get_tool_calls() else "no_action")
-            return finish(status, index + 1)
-        for call in calls:
-            if not isinstance(call, dict) or call.get("type") != "function" or not isinstance(call.get("function"), dict) or not isinstance(call.get("id"), str) or not call["id"]:
-                invalid_proposals += 1
-                _record(item, index, call, log, validation={"ok": False, "error": "not a native function call"}, executed=False, error="not a native function call")
-                continue
-            emitted_name = call["function"].get("name", "")
-            if not isinstance(emitted_name, str) or not emitted_name:
-                reject(index, call, {"ok": False, "error": "missing function name"})
-                continue
-            name = aliases.get(emitted_name, emitted_name)
-            raw = call["function"].get("arguments", "")
+            choice=response['choices'][0]; message=choice['message']; calls=message.get('tool_calls') or []
+            if not isinstance(message,dict) or not isinstance(calls,list) or (message.get('content') is not None and not isinstance(message['content'],str)):
+                raise ValueError('malformed assistant message')
+        except (KeyError,IndexError,TypeError,ValueError,AttributeError) as exc:
+            log('protocol_events',dict(sample_id=item['id'],turn=index,kind='invalid_response',error=str(exc)))
+            if repair_used or index+1>=max_turns:return finish('output_error',index+1)
+            repair_used=True
+            messages.append({'role':'system','content':'Previous response was malformed; no tools from it were executed. Return a valid native tool response or a normal final response. Do not repeat committed actions.'})
+            continue
+        content=message.get('content') or ''
+        log('llm_turns',dict(sample_id=item['id'],turn=index,messages=sent,output=message,
+            finish_reason=choice.get('finish_reason'),usage=response.get('usage'),latency_seconds=time.monotonic()-t0))
+        if time.monotonic()-start >= deadline_seconds:
+            log('terminations',dict(sample_id=item['id'],status='timeout',turns=index+1))
+            raise TimeoutError('LLM response exceeded per-sample deadline')
+        protocol_error = ('output_truncated' if choice.get('finish_reason')=='length' else
+                          'invalid_protocol' if content and not calls and _fake_narration(content) else None)
+        if choice.get('finish_reason') == 'tool_calls' and not calls:
+            protocol_error = 'invalid_protocol'
+        # Validate the native envelope for the whole batch before committing any call.
+        prepared=[]
+        for candidate in calls:
             try:
-                args = json.loads(raw) if isinstance(raw, str) else raw
-                if not isinstance(args, dict):
-                    raise ValueError("arguments must be an object")
-            except (ValueError, TypeError) as exc:
-                invalid_proposals += 1
-                _record(item, index, call, log, executed=False, error=str(exc))
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps({"error": str(exc)})})
-                continue
-            if name == "sys.ask_missing_info" and isinstance(args.get("tool_name"), str):
-                args["tool_name"] = aliases.get(args["tool_name"], args["tool_name"])
-            spec = specs_by_name.get(name, {})
-            if spec.get("kind") == "read":   # drop empty optional filters
-                required = set((spec.get("parameters") or {}).get("required") or [])
-                args = {key: value for key, value in args.items() if key in required or value not in (None, "", [], {})}
-            if name in {"weather.get_current", "weather.get_forecast"} and isinstance(args.get("location"), str):
-                city = item["context"].get("user_profile", {}).get("city")   # the profile city the user did not say is the default
-                if isinstance(city, str) and args["location"].casefold().strip() == city.casefold().strip() and city.casefold() not in transcript.casefold():
-                    args.pop("location")
-            validation = env.validate(name, args)
-            if validation["ok"]:   # an x-ref ID must have been seen in a result or the history of the same app
-                for key, prop in (spec.get("parameters") or {}).get("properties", {}).items():
-                    reference = prop.get("x-ref")
-                    if reference and key in args and (not isinstance(args[key], str) or args[key] not in observed_ids.get(reference.split(".", 1)[0], set())):
-                        validation = {"ok": False, "error": f"{key} must come from an observed {reference} ID; call a read tool first"}
+                fn=candidate['function']
+                if candidate.get('type')!='function' or not isinstance(candidate.get('id'),str) or not candidate['id'] or not isinstance(fn.get('name'),str) or not fn['name']:
+                    raise ValueError('invalid native envelope')
+                raw=fn.get('arguments','')
+                parsed=json.loads(raw) if isinstance(raw,str) else raw
+                if not isinstance(parsed,dict):raise ValueError('arguments must be an object')
+                prepared.append((candidate,fn['name'],dict(parsed)))
+            except (KeyError,ValueError,TypeError,AttributeError):
+                protocol_error = 'invalid_protocol'
+                break
+        if protocol_error:
+            log('protocol_events',dict(sample_id=item['id'],turn=index,kind=protocol_error))
+            # Discard the whole uncommitted response, including partially parsed native calls.
+            if repair_used or index+1>=max_turns:return finish(protocol_error,index+1)
+            repair_used=True
+            messages.append({'role':'system','content':f'Previous response failed ({protocol_error}); none of its tool proposals were executed. Use native tool_calls, not textual tool markup. Return a compact response within the output budget; do not repeat already committed actions.'})
+            continue
+        messages.append({'role':'assistant','content':message.get('content'),'tool_calls':calls} if calls else {'role':'assistant','content':content})
+        if not calls:
+            status = ('unresolved_tool_error' if policy.unresolved() else
+                      'missing_information' if missing_info else
+                      'search_unresolved' if pending_searches else
+                      'recovered_with_errors' if policy.issues else
+                      'unsupported' if 'UNSUPPORTED_REQUEST' in content else
+                      'completed_write' if completed_write else 'completed_read' if env.get_tool_calls() else 'no_action')
+            return finish(status,index+1)
+        for call,emitted_name,args in prepared:
+            name=aliases.get(emitted_name,emitted_name)
+            if name=='sys.ask_missing_info' and isinstance(args.get('tool_name'),str):
+                args['tool_name']=aliases.get(args['tool_name'],args['tool_name'])
+            spec=specs_by_name.get(name,{})
+            kind=spec.get('kind','unknown')
+            if kind=='read':
+                required=set((spec.get('parameters') or {}).get('required') or [])
+                args={k:v for k,v in args.items() if k in required or v not in (None,'',[],{})}
+            if name in {'weather.get_current','weather.get_forecast'} and isinstance(args.get('location'),str):
+                city=item['context'].get('user_profile',{}).get('city')
+                if isinstance(city,str) and args['location'].casefold().strip()==city.casefold().strip() and city.casefold() not in transcript.casefold():args.pop('location')
+            validation=env.validate(name,args)
+            if validation['ok']:
+                for key,prop in (spec.get('parameters') or {}).get('properties',{}).items():
+                    reference=prop.get('x-ref')
+                    if reference and key in args and (not isinstance(args[key],str) or args[key] not in observed_ids.get(reference.split('.',1)[0],set())):
+                        validation={'ok':False,'error':f'{key} must come from an observed {reference} ID; call a read tool first'}
                         break
-            if not validation["ok"]:
-                reject(index, call, validation)
+            if not validation['ok']:
+                reject(index,call,name,args,validation['error'],'schema',write_issue=kind!='read')
+                if kind=='read':pending_searches.add((name,'schema'))
                 continue
-            signature = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
-            if dedup_calls and signature in executed_results:
-                # Repeating an identical call never helps (2/1545 TRAIN labels repeat one, both writes of a second item) and every
-                # executed call counts in the scored list; return the earlier result instead and stop a loop after three repeats.
-                duplicate_blocks += 1
-                _record(item, index, call, log, validation={"ok": False, "error": "duplicate call blocked"}, executed=False)
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps({"ok": False, "error": "Lệnh này đã được gọi với đúng các tham số này; kết quả đã có ở trên. Không gọi lại; làm bước tiếp theo hoặc kết thúc.", "previous_result": executed_results[signature]}, ensure_ascii=False)[:16000]})
-                if duplicate_blocks >= 3:
-                    return finish("duplicate_loop", index + 1)
+            error=policy.precondition_error(name,args) if kind=='write' else None
+            if error:
+                reject(index,call,name,args,error,'precondition',write_issue=True)
                 continue
-            if retry_cap and spec.get("kind") == "read" and empty_reads.get(name, 0) >= retry_cap:
-                # Recovery training (scripts/data/inject_recovery.py) taught one retry after an empty search; without a cap the model
-                # keeps retrying (val q35_p1: 10 flight searches over successive dates where gold asks for the date).
-                duplicate_blocks += 1
-                _record(item, index, call, log, validation={"ok": False, "error": "retry cap"}, executed=False)
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps({"ok": False, "error": f"{name} đã trả về rỗng {empty_reads[name]} lần; không gọi lại tool này. Nếu còn thiếu thông tin bắt buộc thì gọi sys.ask_missing_info, nếu không thì làm bước tiếp theo hoặc kết thúc."}, ensure_ascii=False)})
-                if duplicate_blocks >= 3:
-                    return finish("duplicate_loop", index + 1)
+            sig=signature(name,args)
+            previous=policy.cached_read(name,args) if kind=='read' else None
+            repeated_write=kind=='write' and ((policy.executed[sig]>0 and not policy.repeat_allowed(name,args)) or policy.repeated_failed_write(name,args))
+            if dedup_calls and (previous is not None or repeated_write):
+                error='duplicate call blocked; use the previous result, move to a different requested goal, or ask for unresolved information. No environment call was executed.'
+                reject(index,call,name,args,error,'duplicate',write_issue=repeated_write)
+                if previous is not None:messages[-1]['content']=json.dumps({'ok':False,'error':error,'previous_result':previous},ensure_ascii=False)
+                if blocks['duplicate']>=3:return finish('duplicate_loop',index+1)
                 continue
-            t0 = time.monotonic()
-            result = env.call(name, args)
-            executed_results[signature] = result
-            if spec.get("kind") == "read" and _empty_result(result):
-                empty_reads[name] = empty_reads.get(name, 0) + 1
-            result_outcome = outcome(result, spec.get("kind", "unknown"))
+            if kind=='read':
+                denied=policy.read_error(name,args,retry_cap)
+                if denied:
+                    category,error=denied
+                    pending_searches.add((name,policy.search_group(name,args)['selector']))
+                    reject(index,call,name,args,error,category)
+                    if blocks[category]>=3:return finish(category,index+1)
+                    continue
+            t0=time.monotonic()
+            result=env.call(name,args)
+            result_outcome=outcome(result,kind)
+            if kind=='read':
+                empty=_empty_result(result)
+                policy.record_read(name,args,result,empty)
+                pending_searches.discard((name,'schema'))
+                if not empty:pending_searches.discard((name,policy.search_group(name,args)['selector']))
+            policy.observe(name,args,result,kind)
             if successful(result):
-                observed_ids.setdefault(name.split(".", 1)[0], set()).update(ids_in(result))
-            if name == "sys.ask_missing_info" and successful(result):
-                missing_info = True
-            if spec.get("kind") == "write":
-                completed_write |= result_outcome == "completed"
-                failed_write |= result_outcome != "completed"
-            _record(item, index, call, log, validation=validation, executed=True, name=name, arguments=args, result=result,
-                    outcome=result_outcome, latency_seconds=time.monotonic() - t0)
-            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": json.dumps(result, ensure_ascii=False)[:16000]})
-    log("terminations", {"sample_id": item["id"], "status": "step_limit", "turns": max_turns})
-    raise RuntimeError(f"agent exceeded {max_turns} LLM turns")
+                observed_ids.setdefault(name.split('.',1)[0],set()).update(ids_in(result))
+                if kind=='write':policy.executed[sig]+=1
+                # The policy observes only results, never the simulator's private state.
+            if name=='sys.ask_missing_info' and successful(result):
+                missing_info=True
+                pending_searches={g for g in pending_searches if g[0]!=args.get('tool_name')}
+            if kind=='write':completed_write |= result_outcome=='completed'
+            _record(item,index,call,log,validation=validation,executed=True,name=name,arguments=args,result=result,
+                    outcome=result_outcome,latency_seconds=time.monotonic()-t0)
+            messages.append({'role':'tool','tool_call_id':call['id'],'content':json.dumps(result,ensure_ascii=False)[:16000]})
+    log('terminations',dict(sample_id=item['id'],status='step_limit',turns=max_turns,operation_issues=policy.issues,block_counts=dict(blocks)))
+    raise RuntimeError(f'agent exceeded {max_turns} LLM turns')

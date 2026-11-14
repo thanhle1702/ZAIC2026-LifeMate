@@ -1,0 +1,18 @@
+.live-panel { margin-bottom: 16px; padding: 16px 18px; border-color: #aec9bf; }
+.live-heading, .live-heading>div, .live-detail, .live-bottom, .live-bottom>span, .live-wait { display: flex; align-items: center; gap: 10px; }
+.live-heading { justify-content: space-between; flex-wrap: wrap; }
+.live-heading>div { flex-wrap: wrap; color: #1d6240; }
+.live-heading strong { font-size: 14px; }
+.live-heading .button { font-size: 12px; padding: 6px 10px; }
+.live-detail { justify-content: space-between; flex-wrap: wrap; margin-top: 16px; color: #495766; font-size: 13px; }
+.live-detail>code { max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #141b23; }
+.live-progress { height: 4px; margin: 12px 0; background: #c3ced7; overflow: hidden; }
+.live-progress>i { height: 100%; display: block; background: #269d71; transition: width .3s ease; }
+.live-bottom { justify-content: space-between; flex-wrap: wrap; font-size: 12px; color: #3b4957; }
+.live-bottom>span { flex-wrap: wrap; gap: 5px; }
+.live-wait { margin: 13px 0; font-size: 13px; color: #4d5c6b; }
+.live-warning { font-size: 13px; color: #966818; margin-top: 10px; }
+.live-hint { color: #6c7c8b; font-size: 12px; margin-top: 10px; }
+.live-score { display: flex; flex-wrap: wrap; gap: 10px 20px; margin: 12px 0; font-size: 13px; color: #3b4957; }.live-score strong { color: #1d6240; }
+.sample-run-status { display: block; font-size: 12px; margin-top: 4px; color: #576574; }
+@media (max-width: 600px) { .live-panel { padding: 12px; }.live-detail>code { max-width: 100%; flex-basis: 100%; }.live-heading>div { gap: 6px; }.live-heading .tag { font-size: 11px; } }
