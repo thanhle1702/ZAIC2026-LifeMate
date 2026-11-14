@@ -79,27 +79,20 @@ def test_failed_write_is_not_executed_again_without_new_information():
     assert len(env.calls)==1 and termination['status']=='duplicate_loop'
 
 
-def test_visible_capacity_guard_uses_latest_observations_and_skips_unknowns():
+def test_no_guard_for_apps_outside_train():
+    # Guards name TRAIN apps only; a public-only app is never blocked on observed quantities.
     p=ActionPolicy('use three')
-    assert p.precondition_error('pantry.consume',{'item_id':'p1','quantity':3}) is None
     p.observe('pantry.list_items',{}, {'ok':True,'items':[{'id':'p1','stock':2}]},'read')
-    assert p.precondition_error('pantry.consume',{'item_id':'p1','quantity':3})
-    p.observe('pantry.consume',{'item_id':'p1','quantity':1},{'ok':True},'write')
-    assert p.precondition_error('pantry.consume',{'item_id':'p1','quantity':2})
-    assert p.precondition_error('pantry.consume',{'item_id':'p1','quantity':1}) is None
+    assert p.precondition_error('pantry.consume',{'item_id':'p1','quantity':3}) is None
 
 
-def test_bank_wallet_and_seat_guards_update_after_successful_writes():
+def test_bank_and_wallet_guards_update_after_successful_writes():
     p=ActionPolicy('pay and book')
     p.observe('banking.get_balance',{}, {'ok':True,'accounts':[{'id':'a1','balance':300}]},'read')
     p.observe('banking.transfer',{'from_account_id':'a1','beneficiary_id':'b1','amount':200},{'ok':True,'balance':100},'write')
     assert p.precondition_error('banking.transfer',{'from_account_id':'a1','amount':150})
     p.observe('ewallet.get_balance',{}, {'ok':True,'balance':50},'read')
     assert p.precondition_error('ewallet.pay_qr',{'merchant_id':'m1','amount':60})
-    p.observe('train_bus_tickets.search',{}, {'ok':True,'trips':[{'id':'t1','seats_left':2}]},'read')
-    assert p.precondition_error('train_bus_tickets.book',{'trip_id':'t1','seats':3})
-    p.observe('train_bus_tickets.book',{'trip_id':'t1','seats':2},{'ok':True,'booking':{'id':'b1'}},'write')
-    assert p.precondition_error('train_bus_tickets.book',{'trip_id':'t1','seats':1})
 
 
 def test_failed_transfer_can_recover_using_another_account_but_not_another_payee():
@@ -112,9 +105,9 @@ def test_failed_transfer_can_recover_using_another_account_but_not_another_payee
     assert not p.unresolved() and p.issues[0]['state']=='recovered'
 
 
-def test_success_in_shopping_does_not_resolve_failed_pantry_consumption():
-    p=ActionPolicy('consume then shop')
-    p.observe('pantry.consume',{'item_id':'p1','quantity':3},{'ok':True,'done':False},'write')
+def test_success_in_another_app_does_not_resolve_failed_write():
+    p=ActionPolicy('do then shop')
+    p.observe('tasks.complete',{'task_id':'t1'},{'ok':True,'done':False},'write')
     p.observe('shopping_list.add',{'name':'item','quantity':1},{'ok':True,'item':{'id':'s1'}},'write')
     assert len(p.unresolved())==1
 

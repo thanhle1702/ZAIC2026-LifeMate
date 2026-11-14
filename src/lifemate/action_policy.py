@@ -48,11 +48,6 @@ class ActionPolicy:
         if name == 'banking.transfer':
             # Changing the funding account can recover the same transfer. Amount/payee must match.
             target.pop('from_account_id', None)
-        if name == 'train_bus_tickets.book':
-            trip = self.entity('train_bus_tickets', args.get('trip_id'))
-            if all(trip.get(k) for k in ('origin', 'destination', 'date')):
-                target = {k: trip[k] for k in ('origin', 'destination', 'date')}
-                target['seats'] = args.get('seats')
         return signature(name, target)
 
     def issue(self, name, args, reason, kind):
@@ -89,17 +84,7 @@ class ActionPolicy:
             self.searches = {n:g for n,g in self.searches.items() if n.split('.',1)[0] != app}
             old = dict(self.entities)
             self.entities = {k:v for k,v in self.entities.items() if k[0] != app}
-            # Preserve only quantities whose transition is explicit in these tool contracts.
-            known = {
-                'pantry.consume': ('item_id', 'stock', 'quantity'),
-                'train_bus_tickets.book': ('trip_id', 'seats_left', 'seats'),
-            }.get(name)
-            if known:
-                id_key, field, amount = known
-                entity = dict(old.get((app, args.get(id_key)), {}))
-                if numeric(entity.get(field)) and numeric(args.get(amount)):
-                    entity[field] -= args[amount]
-                    self.entities[(app, args[id_key])] = entity
+            # Preserve only quantities whose transition is explicit in the tool result (TRAIN apps only).
             if name == 'banking.transfer' and numeric(result.get('balance')):
                 entity = dict(old.get((app,args.get('from_account_id')), {}))
                 entity.update(id=args['from_account_id'], balance=result['balance'])
@@ -117,8 +102,6 @@ class ActionPolicy:
 
     def precondition_error(self, name, args):
         contract = {
-            'pantry.consume': ('pantry','item_id','quantity','stock'),
-            'train_bus_tickets.book': ('train_bus_tickets','trip_id','seats','seats_left'),
             'banking.transfer': ('banking','from_account_id','amount','balance'),
         }.get(name)
         if contract:
