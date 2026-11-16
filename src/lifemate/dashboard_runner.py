@@ -67,6 +67,13 @@ def run(directory):
     served = {m['id'] for m in identity.get('data', [])}
     if members and not {name for name, _ in members} <= served:
         raise ValueError(f'Colab does not serve every vote member: {[n for n, _ in members]} vs {sorted(served)}')
+    # Listed by vLLM is not enough (the gateway keeps its own allow-list): every member must answer a real request.
+    for name, _ in members:
+        try:
+            hosted.for_model(name).complete([{'role': 'user', 'content': 'ping'}], [{'type': 'function', 'function': {
+                'name': 'noop', 'description': 'no-op', 'parameters': {'type': 'object', 'properties': {}}}}], timeout=60)
+        except Exception as exc:
+            raise ValueError(f'Vote member {name} does not answer: {exc}') from exc
     llm = EnsembleChat(None, members, client=hosted.for_model) if members else hosted
     label = MODEL if not members else 'Qwen3.5-4B BF16 vote ' + '+'.join(n for n, _ in members) + ' / Gipformer'
     atomic(checkpoint, {'signature': signature, 'runtime': identity, 'ids': [s['id'] for s in samples],
@@ -152,7 +159,7 @@ def run(directory):
                             emit('tool_executed',tool_name=name,arguments=args,result=record.get('result'),step=record['turn'],outcome=record.get('outcome'),elapsed_seconds=record.get('latency_seconds'))
                         else:
                             error=validation.get('error',record.get('error','Rejected'))
-                            guard=record.get('block_reason') in ('precondition','duplicate','retry_budget_exhausted','search_constraint_change')
+                            guard=record.get('block_reason') in ('precondition','duplicate','retry_budget_exhausted','search_constraint_change','date_reference')
                             step['guardError' if guard else 'validationError']=error
                             step['blockReason']=record.get('block_reason')
                             if guard:emit('candidate_blocked',source='harness_guard',tool_name=name,arguments=args,error=error,step=record['turn'],block_reason=record.get('block_reason'))

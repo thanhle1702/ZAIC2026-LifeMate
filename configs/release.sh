@@ -1,4 +1,4 @@
-# Released pipeline (public 61.26, 2026-11-09):
+# Released pipeline (main adapter alone public 61.26, 2026-11-09; with the step-level vote below 64.53, 2026-11-15):
 #   Gipformer ASR "final" (68M, fine-tuned on all TRAIN audio) on CPU
 #   -> Qwen3.5-4B + LoRA "p1" (all TRAIN tasks, E1P prompt, recovery rows, message text weight 0.3) in vLLM
 #   -> agent loop on the sample's single ToolEnv (schema and x-ref checks, no repeats, retry cap 2, 10 turns).
@@ -15,14 +15,17 @@ ASR_DIRNAME=asr-gipformer                # Gipformer ONNX (encoder, decoder, joi
 LORA_NAME=lifemate                       # served model id of the main adapter
 LORA_DIRNAME=llm-lora-p1                 # main adapter: Qwen3.5-4B LoRA "p1"
 
+# Final submission (2026-11-16, public 64.55): the third vote member is synth2 (synth v2 data, notebooks/train_synth2_colab.ipynb),
+# folder llm-lora-synth2 next to the release adapters; adapter_model.safetensors sha256
+# 7713f1803f1f81c2574541bfee6a97f187a4575a56cef1494ee265d5bf3f37d5. The released llm-lora-synth (synth v1) scored 64.22-64.53.
 # Step-level vote: "served:orchestration,..." with the main adapter first (it breaks ties). Empty = the main adapter alone.
-# Public: main adapter alone 61.26; the vote of the three is scored with the same ASR in result/submission_ens3full_*.jsonl.
-ENSEMBLE=""
-# ENSEMBLE="lifemate:E1P,lifemate_e1:E1,lifemate_synth:E1"
+# Public: main adapter alone 61.26; the vote of the three 63.42 (2026-11-14, same ASR and harness).
+ENSEMBLE="lifemate:E1P,lifemate_e1:E1,lifemate_synth:E1"
+# ENSEMBLE=""   # main adapter alone (public 61.26)
 
 # Adapters the vLLM server loads, as served_name=folder (folder under the checkpoint root of the caller).
 LORA_ADAPTERS=("$LORA_NAME=$LORA_DIRNAME")
-if [ -n "$ENSEMBLE" ]; then LORA_ADAPTERS+=("lifemate_e1=llm-lora-e1" "lifemate_synth=llm-lora-synth"); fi
+if [ -n "$ENSEMBLE" ]; then LORA_ADAPTERS+=("lifemate_e1=llm-lora-e1" "lifemate_synth=llm-lora-synth2"); fi
 
 # vLLM: text layers only, Qwen3.5 tool and reasoning parsers, 16k context, seeded. Prefix caching stays on (two single-stream
 # runs of 50 val samples: 0/50 rows differ with it, 2/50 without). Every adapter stays resident (--max-loras), so a vote

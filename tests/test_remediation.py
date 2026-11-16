@@ -150,3 +150,40 @@ def test_redeem_clause_needs_the_real_word_doi(request_text,allowed):
     p=ActionPolicy(request_text)
     p.observe('loyalty.get_points',{}, {'ok':True,'programs':[{'id':'p','points':100,'rewards':[{'id':'r','cost':10}]}]},'read')
     assert p.repeat_allowed('loyalty.redeem',{'program':'p','reward_id':'r'}) is allowed
+
+
+def test_next_week_weekday_still_ahead_this_week_is_flagged():
+    p=ActionPolicy('đặt vé chuyến bay đi đà nẵng thứ bảy tuần sau','2026-09-24T09:00:00+07:00')   # Thursday
+    assert '2026-10-03' in p.date_error({'origin':'HAN','destination':'DAD','date':'2026-09-26'})
+    assert p.date_error({'origin':'HAN','destination':'DAD','date':'2026-10-03'}) is None
+    assert ActionPolicy('thứ bảy này và thứ bảy tuần sau','2026-09-24T09:00:00+07:00').date_error({'date':'2026-09-26'}) is None
+    assert ActionPolicy('thứ ba tuần sau','2026-09-24T09:00:00+07:00').date_error({'date':'2026-09-29'}) is None   # already past this week
+
+
+def test_spoken_hour_shifted_by_twelve_is_flagged():
+    now='2026-10-19T09:00:00+07:00'
+    p=ActionPolicy('một giờ trưa nay đặt báo thức kêu tôi',now)
+    assert '13' in p.date_error({'time':'2026-10-19T12:00:00+07:00'})
+    assert p.date_error({'time':'2026-10-19T13:00:00+07:00'}) is None
+    assert '15' in ActionPolicy('ba giờ chiều mai nhắc tôi',now).date_error({'time':'2026-10-20T03:00:00+07:00'})
+    assert ActionPolicy('chín giờ tối nhắc tôi',now).date_error({'time':'2026-10-19T21:00:00+07:00'}) is None
+    # a derived time (thirty minutes before) is not a confusion of the spoken hour
+    assert ActionPolicy('xe đón bảy giờ tối, nhắc trước nửa tiếng',now).date_error({'time':'2026-10-19T18:30:00+07:00'}) is None
+
+
+def test_list_all_fallback_survives_an_exhausted_query_budget():
+    p=ActionPolicy('mua vé xem stand up comedy')
+    for q in ('Startup Community','Startup'):
+        p.record_read('event_tickets.search',{'query':q},{'ok':True,'events':[]},True)
+    assert p.read_error('event_tickets.search',{'query':'Star'},2)[0]=='retry_budget_exhausted'
+    assert p.read_error('event_tickets.search',{},2) is None
+    route={'origin':'Hà Nội','destination':'Huế','date':'2026-10-10'}
+    for _ in range(2): p.record_read('train_bus_tickets.search',route,{'ok':True,'trips':[]},True)
+    assert p.read_error('train_bus_tickets.search',{**route,'passengers':2},2)[0]=='retry_budget_exhausted'
+
+
+def test_three_blocked_proposals_in_a_row_stop_the_sample():
+    model=ResponsesLLM([response(call=('tasks__add',{'title':'one'}))]+[response(call=('tasks__add',{'title':'one'}))]*5+[response()])
+    env,termination,events=run(model,[WRITE],text='tạo một việc',dedup_calls=True)
+    assert len(env.calls)==1 and termination['status']=='duplicate_loop'
+    assert len([r for k,r in events if k=='model_request' and r['stage']=='started'])==4   # 1 executed + 3 blocked

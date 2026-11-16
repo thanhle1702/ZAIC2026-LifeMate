@@ -1,6 +1,7 @@
 # LifeMate solution (Zalo AI Challenge 2026, Track 1)
 
-Release `lifemate-final` (public test **61.26**, 2026-11-09). A spoken Vietnamese request becomes tool calls on the sample's
+Release `lifemate-final` with a step-level vote of its three LoRA adapters (public test **64.53**, 2026-11-15; the main
+adapter alone scored 61.26 on 2026-11-09). A spoken Vietnamese request becomes tool calls on the sample's
 single `ToolEnv`: Gipformer ASR on CPU, then a Qwen3.5-4B agent with a LoRA adapter, served by a local vLLM.
 
 ## Run
@@ -49,8 +50,16 @@ ToolEnv and that state's hash.
    or at the 27 s deadline of the sample (ASR included).
 4. **Output.** The line is exactly `env.get_tool_calls()` and `env.get_state_hash()`.
 
-Optional, off in this release: a step-level vote of the three adapters in `/code/models/` (`ENSEMBLE` in
-`/code/configs/release.sh`). Each turn all three propose a call and only the majority call runs, on the same single ToolEnv.
+**Step-level vote (on in this image).** `ENSEMBLE` in `/code/configs/release.sh` lists the three adapters in `/code/models/`
+(`llm-lora-p1` with the E1P prompt, `llm-lora-e1` and `llm-lora-synth` with the E1 prompt). Each turn all three propose the next
+call in parallel and only the majority proposal runs, on the same single ToolEnv (`src/lifemate/ensemble.py`); proposals that
+differ only in letter case or spacing count as one, and a three-way split goes to `llm-lora-p1`.
+
+**More checks before `env.call`** (`src/lifemate/action_policy.py`; no rule names an app that only appears in the test sets):
+   - "thứ X tuần sau" (weekday X of next week) written as this week's date, or a spoken "X giờ sáng/chiều/tối" written 12 hours
+     off, goes back to the model with the right date or hour;
+   - after a search came back empty twice and is blocked, a call that lists everything (no query or ID) is still allowed;
+   - the sample stops after three proposals in a row were blocked, instead of looping until the deadline.
 
 ## Models
 

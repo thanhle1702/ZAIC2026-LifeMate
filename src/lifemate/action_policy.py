@@ -1,5 +1,6 @@
 """Small, observation-only policies. No hidden state, task ontology or model calls."""
 from collections import Counter
+from datetime import date, datetime, timedelta
 import json
 import math
 import re
@@ -47,9 +48,35 @@ def numeric(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+WEEKDAY_WORDS = {'thứ hai': 0, 'thứ ba': 1, 'thứ tư': 2, 'thứ năm': 3, 'thứ sáu': 4, 'thứ bảy': 5, 'chủ nhật': 6}
+WEEKDAY_RE = re.compile(r'(thứ hai|thứ ba|thứ tư|thứ năm|thứ sáu|thứ bảy|chủ nhật)(\s+(?:tuần sau|tuần tới))?')
+HOUR_WORDS = {'một': 1, 'hai': 2, 'ba': 3, 'bốn': 4, 'năm': 5, 'sáu': 6, 'bảy': 7, 'tám': 8, 'chín': 9, 'mười': 10,
+              'mười một': 11, 'mười hai': 12}
+HOUR_RE = re.compile(r'(\d{1,2}|mười một|mười hai|mười|một|hai|ba|bốn|năm|sáu|bảy|tám|chín)\s*(?:giờ|h)\b'
+                     r'(?:\s+(?:rưỡi|kém\s+\S+|\d{1,2}|\d+\s+phút|[a-zà-ỹ]+\s+phút))?\s+(sáng|trưa|chiều|tối|đêm)')
+CLOCK_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T(\d{2}):')
+
+
+def spoken_hours(text):
+    """24h hours of clock times said with a day period ("một giờ trưa" -> 13, "chín giờ tối" -> 21)."""
+    out = []
+    for m in HOUR_RE.finditer(unicodedata.normalize('NFC', text).lower()):
+        h = int(m[1]) if m[1].isdigit() else HOUR_WORDS[m[1]]
+        if h > 12: out.append((h, m[0])); continue
+        period = m[2]
+        if period == 'sáng': e = 0 if h == 12 else h
+        elif period == 'trưa': e = h if h >= 10 else h + 12
+        elif period == 'chiều': e = 12 if h == 12 else h + 12
+        elif period == 'tối': e = (h + 12) % 24
+        else: e = h + 12 if h >= 7 and h != 12 else (0 if h == 12 else h)   # đêm: 11 giờ đêm = 23, 1 giờ đêm = 1
+        out.append((e, m[0]))
+    return out
+
+
 class ActionPolicy:
-    def __init__(self, request):
+    def __init__(self, request, current_time=None):
         self.request = request
+        self.today = datetime.fromisoformat(current_time).date() if isinstance(current_time, str) else None
         self.entities = {}
         self.wallet_balance = None
         self.generation = Counter()
@@ -134,6 +161,38 @@ class ActionPolicy:
                 return f'amount={args["amount"]} exceeds observed wallet balance={self.wallet_balance}; resolve the user condition before paying.'
         return None
 
+    def date_error(self, args):
+        """TRAIN convention: "thứ X tuần sau" is weekday X of the next Monday-Sunday week. When X is still ahead this week the
+        model often takes this week's X; flag a call that uses only that date (and never the next-week one)."""
+        if self.today is None: return None
+        text = unicodedata.normalize('NFC', self.request).lower()
+        mentions = [(WEEKDAY_WORDS[m[1]], bool(m[2]), m[0]) for m in WEEKDAY_RE.finditer(text)]
+        plain = {k for k, nxt, _ in mentions if not nxt}
+        values = json.dumps(args, ensure_ascii=False)
+        monday = self.today - timedelta(days=self.today.weekday())
+        for k, nxt, phrase in mentions:
+            if not nxt or k in plain or k <= self.today.weekday(): continue
+            wrong, right = monday + timedelta(days=k), monday + timedelta(days=7 + k)
+            if wrong.isoformat() in values and right.isoformat() not in values:
+                return (f'"{phrase}" là {right.isoformat()} (tuần sau = next_week {(monday + timedelta(days=7)).isoformat()} .. '
+                        f'{(monday + timedelta(days=13)).isoformat()}); {wrong.isoformat()} là {phrase.split()[0]} {phrase.split()[1]} tuần này. '
+                        f'Dùng ngày {right.isoformat()}.')
+        return self.hour_error(args)
+
+    def hour_error(self, args):
+        """A spoken "X giờ <buổi>" turned into the 12h-shifted hour (or 12:00 for "một giờ trưa") while no time argument uses
+        the spoken hour. TRAIN: 0 gold calls flagged."""
+        spoken = spoken_hours(self.request)
+        if not spoken: return None
+        used = [(k, v, int(m[1])) for k, v in args.items() if isinstance(v, str) for m in [CLOCK_RE.match(v)] if m]
+        expected = {e for e, _ in spoken}
+        if not used or any(h in expected for _, _, h in used): return None
+        for key, value, h in used:
+            for e, phrase in spoken:
+                if h in ((e + 12) % 24, (e - 12) % 24) or (e == 13 and h == 12):
+                    return f'"{phrase}" là {e:02d}:xx (24h), nhưng {key}={value} dùng {h:02d}:xx. Dùng giờ {e:02d}.'
+        return None
+
     def repeat_allowed(self, name, args):
         if name != 'loyalty.redeem': return False
         # Split before folding: folded 'doi' would also catch dời/đôi/đội/đối/dõi.
@@ -184,7 +243,10 @@ class ActionPolicy:
             flexible=bool(re.search(r'ngay (?:nao|khac)|bat ky|som nhat|muon nhat',folded(self.request)))
             if changed and not flexible:
                 return 'search_constraint_change', f'Previous search was empty. Keep the user date/route filters {group["filters"]}; do not invent a different date or route. Use only schema-valid query fallback or ask_missing_info.'
-        if cap and group['empty'] >= cap:
+        # Dropping the query after query searches came back empty lists everything: the fallback the prompt asks for, not a guess.
+        # It runs once (an identical call is a duplicate); searches that never had a query (routes) keep the budget.
+        list_all = group['selector'] and not any(k in ('query','symbol') or k.endswith('_id') for k in args)
+        if cap and group['empty'] >= cap and not list_all:
             return 'retry_budget_exhausted', f'This entity search đã trả về rỗng {group["empty"]} lần. Do not retry it. Handle other requested entities or ask_missing_info; do not guess an ID/date.'
         return None
 

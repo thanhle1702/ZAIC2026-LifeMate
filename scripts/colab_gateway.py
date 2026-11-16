@@ -13,8 +13,8 @@ import requests
 
 RELEASE = '02080970ccd59a2e1aeec4fd66a17640da2cddf1'
 # Served adapters a client may ask for: p1 alone, or the three members of the step-level vote (lifemate.ensemble).
-MODELS = {'lifemate', 'lifemate_e1', 'lifemate_synth'}
-CHAT_SLOTS = 3   # one in-flight request per vote member; vLLM batches them (--max-num-seqs >= 3)
+MODELS = {'lifemate', 'lifemate_e1', 'lifemate_synth', 'lifemate_synth2'}
+CHAT_SLOTS = 4   # one in-flight request per vote member; vLLM batches them (--max-num-seqs >= 4)
 
 
 def create_app(asr, key, context_limit=16384):

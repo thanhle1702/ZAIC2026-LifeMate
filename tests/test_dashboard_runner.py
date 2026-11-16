@@ -190,6 +190,8 @@ def test_vote_queries_every_served_member_and_records_votes(setup, monkeypatch):
         log('terminations',{'status':'no_action'})
     monkeypatch.setattr(d,'execute',execute)
     d.run(setup)
+    pings=[n for n,c,_ in asked if c=='ping']; asked=[a for a in asked if a[1]!='ping']
+    assert sorted(pings)==['lifemate','lifemate_e1','lifemate_synth']    # every member answered before the run
     assert sorted(n for n,_,_ in asked)==['lifemate','lifemate_e1','lifemate_synth']
     assert all(t==5 for _,_,t in asked)
     assert replies[0]['choices'][0]['message']['content']=='done'
@@ -199,6 +201,29 @@ def test_vote_queries_every_served_member_and_records_votes(setup, monkeypatch):
     assert d.read(setup/'job.json')['ensemble']==['lifemate:E1P','lifemate_e1:E1','lifemate_synth:E1']
 
 
+def test_vote_ignores_letter_case_and_spacing_in_arguments():
+    from lifemate.ensemble import _proposal_key
+    def call(origin): return {'choices':[{'message':{'tool_calls':[{'function':{'name':'public_transit__find_routes',
+                              'arguments':json.dumps({'origin':origin,'destination':'Cầu Rồng'})}}]}}]}
+    assert _proposal_key(call('Bến xe Trung tâm'))==_proposal_key(call('bến xe  trung tâm'))
+    assert _proposal_key(call('Bến xe Trung tâm'))!=_proposal_key(call('Bến xe Đà Nẵng'))
+
+
 def test_vote_refuses_a_colab_without_every_member(setup, monkeypatch):
     monkeypatch.setenv('LIFEMATE_ENSEMBLE', 'lifemate:E1P,lifemate_e1:E1')
     with pytest.raises(ValueError, match='every vote member'): d.run(setup)
+
+
+def test_run_stops_when_a_listed_member_rejects_requests(setup, monkeypatch):
+    monkeypatch.setenv('LIFEMATE_ENSEMBLE', 'lifemate:E1P,lifemate_synth2:E1')
+    class Member:
+        def __init__(self,name): self.name=name
+        def complete(self,*a,**k):
+            if self.name=='lifemate_synth2': raise RuntimeError('Colab HTTP 400')
+            return {}
+    class Host(d.Hosted):
+        def __init__(self,*a): pass
+        def request(self,*a): return {'release_revision': d.RELEASE, 'data':[{'id':'lifemate'},{'id':'lifemate_synth2'}]}
+        def for_model(self,name): return Member(name)
+    monkeypatch.setattr(d,'Hosted',Host)
+    with pytest.raises(ValueError, match='lifemate_synth2 does not answer'): d.run(setup)

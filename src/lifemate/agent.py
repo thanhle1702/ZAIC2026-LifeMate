@@ -113,7 +113,7 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
         raise ValueError(f"unknown orchestration: {orchestration}")
     start = time.monotonic()
     structured, observed_ids = structured_history(item.get("history", []), transcribe_history, {s["name"]: s.get("kind", "unknown") for s in specs})
-    policy = ActionPolicy(transcript)
+    policy = ActionPolicy(transcript, item.get('context', {}).get('current_time'))
     for action in structured['historical_actions']:
         if action.get('verified'):
             policy.observe(action['tool'], action.get('arguments',{}), action['result'], action['kind'], historical=True)
@@ -128,6 +128,9 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
     blocks = Counter()
     repair_used = False
     pending_searches = set()
+    # Proposals rejected in a row since the last executed call. Across public and train runs, no
+    # sample ever did anything useful after three in a row; stopping saves ~10 s of model calls.
+    blocked_streak = 0
 
     def finish(status, turns):
         log('terminations', dict(sample_id=item['id'], status=status, turns=turns,
@@ -138,8 +141,9 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
         return dict(id=item['id'], tool_calls=env.get_tool_calls(), state_hash=env.get_state_hash())
 
     def reject(index, call, name, args, error, category='schema', write_issue=False):
-        nonlocal invalid_proposals
+        nonlocal invalid_proposals, blocked_streak
         invalid_proposals += 1
+        blocked_streak += 1
         blocks[category] += 1
         _record(item,index,call,log,executed=False,name=name,arguments=args,
                 validation={'ok':False,'error':error},block_reason=category)
@@ -236,6 +240,10 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
                 reject(index,call,name,args,validation['error'],'schema',write_issue=kind!='read')
                 if kind=='read':pending_searches.add((name,'schema'))
                 continue
+            error=policy.date_error(args) if blocks['date_reference']<2 else None
+            if error:
+                reject(index,call,name,args,error,'date_reference')
+                continue
             error=policy.precondition_error(name,args) if kind=='write' else None
             if error:
                 reject(index,call,name,args,error,'precondition',write_issue=True)
@@ -258,6 +266,7 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
                     if blocks[category]>=3:return finish(category,index+1)
                     continue
             t0=time.monotonic()
+            blocked_streak=0
             result=env.call(name,args)
             result_outcome=outcome(result,kind)
             if kind=='read':
@@ -277,5 +286,6 @@ def execute(item: dict, transcript: str, specs: list[dict], env, llm, transcribe
             _record(item,index,call,log,validation=validation,executed=True,name=name,arguments=args,result=result,
                     outcome=result_outcome,latency_seconds=time.monotonic()-t0)
             messages.append({'role':'tool','tool_call_id':call['id'],'content':json.dumps(result,ensure_ascii=False)[:16000]})
+        if blocked_streak>=3:return finish('duplicate_loop',index+1)
     log('terminations',dict(sample_id=item['id'],status='step_limit',turns=max_turns,operation_issues=policy.issues,block_counts=dict(blocks)))
     raise RuntimeError(f'agent exceeded {max_turns} LLM turns')

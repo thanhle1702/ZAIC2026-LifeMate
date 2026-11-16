@@ -12,11 +12,23 @@ item, transcript and installed specs so each member's head messages can be rebui
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from .agent import prompt_for, user_message
 from .llm import LocalChat
+
+
+def _same_text(value):
+    """Members that differ only in letter case or spacing ("Bến xe Trung tâm" / "Bến xe trung tâm") cast the same vote."""
+    if isinstance(value, str):
+        return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+    if isinstance(value, dict):
+        return {k: _same_text(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_same_text(v) for v in value]
+    return value
 
 
 def _proposal_key(response: dict) -> str:
@@ -31,7 +43,7 @@ def _proposal_key(response: dict) -> str:
             args = json.loads(fn.get("arguments") or "{}")
         except (TypeError, ValueError):
             args = fn.get("arguments")
-        out.append([fn.get("name"), args])
+        out.append([fn.get("name"), _same_text(args)])
     return json.dumps(out, ensure_ascii=False, sort_keys=True)
 
 
